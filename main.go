@@ -27,16 +27,18 @@ type User struct {
 }
 
 type Store struct {
-	mu      sync.Mutex
-	users   map[string]*User
-	bySlack map[string]string
-	path    string
+	mu       sync.Mutex
+	users    map[string]*User
+	bySlack  map[string]string
+	lastTap  map[string]time.Time
+	path     string
 }
 
 func NewStore(path string) *Store {
 	s := &Store{
 		users:   make(map[string]*User),
 		bySlack: make(map[string]string),
+		lastTap: make(map[string]time.Time),
 		path:    path,
 	}
 	s.load()
@@ -106,14 +108,31 @@ func (s *Store) Get(id string) *User {
 	return s.users[id]
 }
 
-func (s *Store) Toggle(id string) (user *User, action string, ok bool) {
+const tapCooldown = 10 * time.Second
+
+func (s *Store) Toggle(id string) (user *User, action string, ok bool, duplicate bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	u, exists := s.users[id]
 	if !exists {
-		return nil, "", false
+		return nil, "", false, false
 	}
+
+	if last, seen := s.lastTap[id]; seen && time.Since(last) < tapCooldown {
+		action = "hi"
+		if u.CheckedIn {
+			action = "bye"
+		}
+		// CheckedIn は前回のToggleで既に反転済みなので、現在の状態の逆が「前回送ったもの」
+		prevAction := "hi"
+		if !u.CheckedIn {
+			prevAction = "bye"
+		}
+		_ = action
+		return u, prevAction, true, true
+	}
+	s.lastTap[id] = time.Now()
 
 	action = "hi"
 	if u.CheckedIn {
@@ -121,7 +140,7 @@ func (s *Store) Toggle(id string) (user *User, action string, ok bool) {
 	}
 	u.CheckedIn = !u.CheckedIn
 	s.save()
-	return u, action, true
+	return u, action, true, false
 }
 
 func (s *Store) Revert(id string) {
@@ -167,7 +186,7 @@ func handleTop(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	sendAttendance(w, cookie.Value)
+	sendAttendance(w, r, cookie.Value)
 }
 
 // GET /register — 登録フォーム
@@ -282,25 +301,27 @@ func handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 }
 
 // hi/bye送信の共通処理
-func sendAttendance(w http.ResponseWriter, userID string) {
-	user, action, ok := store.Toggle(userID)
+func sendAttendance(w http.ResponseWriter, r *http.Request, userID string) {
+	user, action, ok, dup := store.Toggle(userID)
 	if !ok {
 		http.SetCookie(w, &http.Cookie{
 			Name:   cookieName,
 			Path:   "/",
 			MaxAge: -1,
 		})
-		http.Redirect(w, nil, "/register", http.StatusFound)
+		http.Redirect(w, r, "/register", http.StatusFound)
 		return
 	}
 
-	api := slack.New(user.Token)
-	_, _, err := api.PostMessage(channelID, slack.MsgOptionText(action, false))
-	if err != nil {
-		log.Printf("送信エラー (%s): %v", user.Name, err)
-		store.Revert(userID)
-		http.Error(w, "Slackへの送信に失敗しました", http.StatusInternalServerError)
-		return
+	if !dup {
+		api := slack.New(user.Token)
+		_, _, err := api.PostMessage(channelID, slack.MsgOptionText(action, false))
+		if err != nil {
+			log.Printf("送信エラー (%s): %v", user.Name, err)
+			store.Revert(userID)
+			http.Error(w, "Slackへの送信に失敗しました", http.StatusInternalServerError)
+			return
+		}
 	}
 
 	label := "出勤 (hi)"
