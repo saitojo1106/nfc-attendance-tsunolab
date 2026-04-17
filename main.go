@@ -13,6 +13,45 @@ import (
 var api *slack.Client
 var channelID string
 
+const selectPage = `<!DOCTYPE html>
+<html>
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>出退勤</title>
+	<style>
+		* { margin: 0; padding: 0; box-sizing: border-box; }
+		body {
+			display: flex; justify-content: center; align-items: center;
+			height: 100vh; font-family: -apple-system, sans-serif;
+			background: #f5f5f5;
+		}
+		.container { text-align: center; width: 90%%; max-width: 360px; }
+		h1 { font-size: 1.4rem; margin-bottom: 2rem; color: #333; }
+		.btn {
+			display: block; width: 100%%; padding: 1.2rem;
+			margin-bottom: 1rem; border: none; border-radius: 12px;
+			font-size: 1.3rem; font-weight: bold; color: #fff;
+			cursor: pointer; text-decoration: none; text-align: center;
+		}
+		.btn-hi  { background: #4CAF50; }
+		.btn-bye { background: #2196F3; }
+	</style>
+</head>
+<body>
+	<div class="container">
+		<h1>NFC 出退勤</h1>
+		<a class="btn btn-hi"  href="/slack?action=hi">出勤 (hi)</a>
+		<a class="btn btn-bye" href="/slack?action=bye">退勤 (bye)</a>
+	</div>
+</body>
+</html>`
+
+func handleTop(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	fmt.Fprint(w, selectPage)
+}
+
 func handleSlackNotify(w http.ResponseWriter, r *http.Request) {
 	action := r.URL.Query().Get("action")
 	if action != "hi" && action != "bye" {
@@ -30,28 +69,43 @@ func handleSlackNotify(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	label := "出勤"
+	if action == "bye" {
+		label = "退勤"
+	}
+
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
 	<meta charset="utf-8">
 	<meta name="viewport" content="width=device-width, initial-scale=1">
 	<title>送信完了</title>
+	<style>
+		* { margin: 0; padding: 0; box-sizing: border-box; }
+		body {
+			display: flex; justify-content: center; align-items: center;
+			height: 100vh; font-family: -apple-system, sans-serif;
+			background: #f5f5f5;
+		}
+		.container { text-align: center; }
+		h2 { font-size: 1.4rem; color: #333; margin-bottom: 0.5rem; }
+		p  { color: #888; }
+	</style>
 </head>
-<body style="display:flex;justify-content:center;align-items:center;height:100vh;font-family:sans-serif;">
-	<div style="text-align:center;">
-		<h2>Slackに "%s" を送信しました</h2>
+<body>
+	<div class="container">
+		<h2>%s を送信しました</h2>
 		<p>この画面は自動的に閉じます。</p>
 	</div>
 	<script>setTimeout(function(){ window.close(); }, 2000);</script>
 </body>
-</html>`, action)
+</html>`, label)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, html)
 }
 
 func main() {
-	// ローカル開発時は .env から読み込み、クラウドでは環境変数を直接使う
 	_ = godotenv.Load()
 
 	token := os.Getenv("SLACK_USER_TOKEN")
@@ -63,6 +117,7 @@ func main() {
 
 	api = slack.New(token)
 
+	http.HandleFunc("/", handleTop)
 	http.HandleFunc("/slack", handleSlackNotify)
 
 	port := os.Getenv("PORT")
