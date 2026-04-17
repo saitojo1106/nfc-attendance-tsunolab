@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"log"
 	"net/http"
-	"net/url"
 	"os"
 	"strings"
 	"sync"
@@ -135,24 +134,17 @@ func generateID() string {
 
 // --------------- Config ---------------
 
+const hiByeBotOAuthURL = "https://slack.com/oauth/v2/authorize?client_id=2891184249.6899350542852&scope=&user_scope=chat:write"
+
 var (
-	store        *Store
-	channelID    string
-	clientID     string
-	clientSecret string
-	baseURL      string
+	store     *Store
+	channelID string
+	baseURL   string
 )
 
 // --------------- Handlers ---------------
 
 func handleRegister(w http.ResponseWriter, r *http.Request) {
-	authURL := fmt.Sprintf(
-		"https://slack.com/oauth/v2/authorize?client_id=%s&user_scope=%s&redirect_uri=%s",
-		clientID,
-		url.QueryEscape("chat:write,users:read"),
-		url.QueryEscape(baseURL+"/auth/callback"),
-	)
-
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
 <head>
@@ -161,58 +153,68 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	<title>NFC 出退勤 - 登録</title>
 	<style>
 		*{margin:0;padding:0;box-sizing:border-box}
-		body{display:flex;justify-content:center;align-items:center;height:100vh;
-			font-family:-apple-system,sans-serif;background:#f5f5f5}
-		.container{text-align:center;width:90%%;max-width:360px}
-		h1{font-size:1.4rem;margin-bottom:.5rem;color:#333}
-		p{color:#666;margin-bottom:2rem;font-size:.9rem;line-height:1.6}
-		.btn{display:inline-block;padding:1rem 2rem;background:#4A154B;color:#fff;
-			border-radius:8px;text-decoration:none;font-size:1.1rem;font-weight:bold}
+		body{display:flex;justify-content:center;align-items:center;min-height:100vh;
+			font-family:-apple-system,sans-serif;background:#f5f5f5;padding:1rem}
+		.container{text-align:center;width:90%%;max-width:400px}
+		h1{font-size:1.4rem;margin-bottom:1rem;color:#333}
+		.steps{text-align:left;background:#fff;border-radius:8px;padding:1.2rem;
+			margin-bottom:1.5rem;font-size:.9rem;line-height:1.8;color:#444}
+		.steps b{color:#333}
+		.btn{display:inline-block;padding:.8rem 1.5rem;background:#4A154B;color:#fff;
+			border-radius:8px;text-decoration:none;font-size:1rem;font-weight:bold;
+			margin-bottom:1.5rem}
+		form{background:#fff;border-radius:8px;padding:1.2rem}
+		label{display:block;text-align:left;font-size:.85rem;color:#666;margin-bottom:.5rem}
+		input[type=text]{width:100%%;padding:.7rem;border:1px solid #ddd;border-radius:6px;
+			font-size:.9rem;margin-bottom:1rem;font-family:monospace}
+		button{width:100%%;padding:.8rem;background:#4CAF50;color:#fff;border:none;
+			border-radius:8px;font-size:1rem;font-weight:bold;cursor:pointer}
 	</style>
 </head>
 <body>
 	<div class="container">
-		<h1>NFC 出退勤</h1>
-		<p>Slackアカウントと連携して<br>あなた専用のNFC URLを発行します。</p>
-		<a class="btn" href="%s">Slackで登録する</a>
+		<h1>NFC 出退勤 - ユーザー登録</h1>
+		<div class="steps">
+			<b>Step 1:</b> 下のボタンからSlackでトークンを取得<br>
+			<b>Step 2:</b> 表示されたJSONの <code>access_token</code> をコピー<br>
+			<b>Step 3:</b> 下のフォームに貼り付けて登録
+		</div>
+		<a class="btn" href="%s" target="_blank">Slackでトークンを取得</a>
+		<form method="POST" action="/register">
+			<label>アクセストークン（xoxp- から始まる文字列）</label>
+			<input type="text" name="token" placeholder="xoxp-..." required>
+			<button type="submit">登録してNFC URLを発行</button>
+		</form>
 	</div>
 </body>
-</html>`, authURL)
+</html>`, hiByeBotOAuthURL)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, html)
 }
 
-func handleCallback(w http.ResponseWriter, r *http.Request) {
-	if errMsg := r.URL.Query().Get("error"); errMsg != "" {
-		http.Error(w, "Slack認証がキャンセルされました: "+errMsg, http.StatusBadRequest)
+func handleRegisterPost(w http.ResponseWriter, r *http.Request) {
+	if err := r.ParseForm(); err != nil {
+		http.Error(w, "フォームの解析に失敗しました", http.StatusBadRequest)
 		return
 	}
 
-	code := r.URL.Query().Get("code")
-	if code == "" {
-		http.Error(w, "認証コードがありません", http.StatusBadRequest)
+	token := strings.TrimSpace(r.FormValue("token"))
+	if !strings.HasPrefix(token, "xoxp-") {
+		http.Error(w, "トークンは xoxp- から始まる文字列を入力してください", http.StatusBadRequest)
 		return
 	}
 
-	resp, err := slack.GetOAuthV2Response(http.DefaultClient, clientID, clientSecret, code, baseURL+"/auth/callback")
-	if err != nil {
-		log.Printf("OAuth エラー: %v", err)
-		http.Error(w, "Slack認証に失敗しました", http.StatusInternalServerError)
-		return
-	}
-
-	token := resp.AuthedUser.AccessToken
-	slackUID := resp.AuthedUser.ID
-
-	name := slackUID
 	api := slack.New(token)
-	if info, err := api.GetUserInfo(slackUID); err == nil {
-		name = info.RealName
-		if name == "" {
-			name = info.Name
-		}
+	authResp, err := api.AuthTest()
+	if err != nil {
+		log.Printf("トークン検証エラー: %v", err)
+		http.Error(w, "トークンが無効です。正しいトークンを入力してください。", http.StatusBadRequest)
+		return
 	}
+
+	slackUID := authResp.UserID
+	name := authResp.User
 
 	user := store.Upsert(slackUID, name, token)
 	nfcURL := fmt.Sprintf("%s/t/%s", baseURL, user.ID)
@@ -233,7 +235,7 @@ func handleCallback(w http.ResponseWriter, r *http.Request) {
 		h2{font-size:1.3rem;color:#333;margin-bottom:1.5rem}
 		.url-box{background:#fff;border:2px solid #4CAF50;border-radius:8px;
 			padding:1rem;margin-bottom:1rem;word-break:break-all;
-			font-family:monospace;font-size:.85rem}
+			font-family:monospace;font-size:.85rem;user-select:all}
 		.note{color:#888;font-size:.8rem;line-height:1.6}
 	</style>
 </head>
@@ -318,19 +320,22 @@ func main() {
 	_ = godotenv.Load()
 
 	channelID = os.Getenv("SLACK_CHANNEL_ID")
-	clientID = os.Getenv("SLACK_CLIENT_ID")
-	clientSecret = os.Getenv("SLACK_CLIENT_SECRET")
 	baseURL = strings.TrimRight(os.Getenv("BASE_URL"), "/")
 
-	if channelID == "" || clientID == "" || clientSecret == "" || baseURL == "" {
-		log.Fatal("環境変数を設定してください: SLACK_CHANNEL_ID, SLACK_CLIENT_ID, SLACK_CLIENT_SECRET, BASE_URL")
+	if channelID == "" || baseURL == "" {
+		log.Fatal("環境変数を設定してください: SLACK_CHANNEL_ID, BASE_URL")
 	}
 
 	store = NewStore("users.json")
 
+	http.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			handleRegisterPost(w, r)
+		} else {
+			handleRegister(w, r)
+		}
+	})
 	http.HandleFunc("/", handleRegister)
-	http.HandleFunc("/register", handleRegister)
-	http.HandleFunc("/auth/callback", handleCallback)
 	http.HandleFunc("/t/", handleAttendance)
 
 	port := os.Getenv("PORT")
