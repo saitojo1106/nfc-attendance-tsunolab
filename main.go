@@ -27,11 +27,11 @@ type User struct {
 }
 
 type Store struct {
-	mu       sync.Mutex
-	users    map[string]*User
-	bySlack  map[string]string
-	lastTap  map[string]time.Time
-	path     string
+	mu      sync.Mutex
+	users   map[string]*User
+	bySlack map[string]string
+	lastTap map[string]time.Time
+	path    string
 }
 
 func NewStore(path string) *Store {
@@ -102,12 +102,6 @@ func (s *Store) Upsert(slackUID, name, token string) *User {
 	return u
 }
 
-func (s *Store) Get(id string) *User {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.users[id]
-}
-
 const tapCooldown = 10 * time.Second
 
 func (s *Store) Toggle(id string) (user *User, action string, ok bool, duplicate bool) {
@@ -120,16 +114,10 @@ func (s *Store) Toggle(id string) (user *User, action string, ok bool, duplicate
 	}
 
 	if last, seen := s.lastTap[id]; seen && time.Since(last) < tapCooldown {
-		action = "hi"
+		prevAction := "bye"
 		if u.CheckedIn {
-			action = "bye"
+			prevAction = "hi"
 		}
-		// CheckedIn は前回のToggleで既に反転済みなので、現在の状態の逆が「前回送ったもの」
-		prevAction := "hi"
-		if !u.CheckedIn {
-			prevAction = "bye"
-		}
-		_ = action
 		return u, prevAction, true, true
 	}
 	s.lastTap[id] = time.Now()
@@ -161,8 +149,6 @@ func generateID() string {
 // --------------- Config ---------------
 
 const hiByeBotOAuthURL = "https://slack.com/oauth/v2/authorize?client_id=2891184249.6899350542852&scope=&user_scope=chat:write"
-const cookieName = "nfc_uid"
-const cookieMaxAge = 365 * 24 * 60 * 60 // 1年
 
 var (
 	store     *Store
@@ -171,23 +157,6 @@ var (
 )
 
 // --------------- Handlers ---------------
-
-// GET / — Cookieでユーザー判定。登録済みならhi/bye送信、未登録なら登録画面へ
-func handleTop(w http.ResponseWriter, r *http.Request) {
-	cookie, err := r.Cookie(cookieName)
-	if err != nil || cookie.Value == "" {
-		http.Redirect(w, r, "/register", http.StatusFound)
-		return
-	}
-
-	user := store.Get(cookie.Value)
-	if user == nil {
-		http.Redirect(w, r, "/register", http.StatusFound)
-		return
-	}
-
-	sendAttendance(w, r, cookie.Value)
-}
 
 // GET /register — 登録フォーム
 func handleRegister(w http.ResponseWriter, r *http.Request) {
@@ -219,7 +188,7 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 </head>
 <body>
 	<div class="container">
-		<h1>NFC 出退勤 - 初回登録</h1>
+		<h1>NFC 出退勤 - ユーザー登録</h1>
 		<div class="steps">
 			<b>Step 1:</b> 下のボタンからSlackでトークンを取得<br>
 			<b>Step 2:</b> 表示されたJSONの <code>access_token</code> をコピー<br>
@@ -239,7 +208,7 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, html)
 }
 
-// POST /register — トークン検証・登録・Cookie発行
+// POST /register — トークン検証・登録・NFC URL発行
 func handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "フォームの解析に失敗しました", http.StatusBadRequest)
@@ -261,17 +230,9 @@ func handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 	}
 
 	user := store.Upsert(authResp.UserID, authResp.User, token)
+	nfcURL := fmt.Sprintf("%s/t/%s", baseURL, user.ID)
 
-	http.SetCookie(w, &http.Cookie{
-		Name:     cookieName,
-		Value:    user.ID,
-		Path:     "/",
-		MaxAge:   cookieMaxAge,
-		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
-	})
-
-	log.Printf("ユーザー登録: %s (%s)", user.Name, user.SlackUID)
+	log.Printf("ユーザー登録: %s (%s) → %s", user.Name, user.SlackUID, user.ID)
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -281,35 +242,46 @@ func handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 	<title>登録完了</title>
 	<style>
 		*{margin:0;padding:0;box-sizing:border-box}
-		body{display:flex;justify-content:center;align-items:center;height:100vh;
-			font-family:-apple-system,sans-serif;background:#4CAF50;color:#fff}
-		.container{text-align:center;width:90%%;max-width:400px}
-		h2{font-size:1.4rem;margin-bottom:1rem}
-		p{opacity:.9;line-height:1.6}
+		body{display:flex;justify-content:center;align-items:center;min-height:100vh;
+			font-family:-apple-system,sans-serif;background:#f5f5f5;padding:1rem}
+		.container{text-align:center;width:100%%;max-width:400px}
+		h2{font-size:1.3rem;color:#333;margin-bottom:1.5rem}
+		.url-box{background:#fff;border:2px solid #4CAF50;border-radius:8px;
+			padding:1rem;margin-bottom:1rem;word-break:break-all;
+			font-family:monospace;font-size:.85rem;user-select:all}
+		.note{color:#888;font-size:.8rem;line-height:1.6}
+		.note b{color:#333}
 	</style>
 </head>
 <body>
 	<div class="container">
 		<h2>%s さんの登録が完了しました</h2>
-		<p>次回からNFCタグをかざすだけで<br>自動的にhi/byeが送信されます。</p>
+		<p style="margin-bottom:1rem;color:#666;">このURLをNFCタグに書き込んでください：</p>
+		<div class="url-box">%s</div>
+		<p class="note">
+			<b>NFC Tools</b> アプリ → 書き込み → URL/URI<br>
+			→ 上のURLを貼り付けて書き込み<br><br>
+			かざすたびに hi → bye → hi → ... と切り替わります。
+		</p>
 	</div>
 </body>
-</html>`, user.Name)
+</html>`, user.Name, nfcURL)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, html)
 }
 
-// hi/bye送信の共通処理
-func sendAttendance(w http.ResponseWriter, r *http.Request, userID string) {
-	user, action, ok, dup := store.Toggle(userID)
+// GET /t/{id} — NFC タップで hi/bye 送信
+func handleAttendance(w http.ResponseWriter, r *http.Request) {
+	id := strings.TrimPrefix(r.URL.Path, "/t/")
+	if id == "" {
+		http.Error(w, "ユーザーIDがありません", http.StatusBadRequest)
+		return
+	}
+
+	user, action, ok, dup := store.Toggle(id)
 	if !ok {
-		http.SetCookie(w, &http.Cookie{
-			Name:   cookieName,
-			Path:   "/",
-			MaxAge: -1,
-		})
-		http.Redirect(w, r, "/register", http.StatusFound)
+		http.Error(w, "ユーザーが見つかりません。/register から登録してください。", http.StatusNotFound)
 		return
 	}
 
@@ -318,7 +290,7 @@ func sendAttendance(w http.ResponseWriter, r *http.Request, userID string) {
 		_, _, err := api.PostMessage(channelID, slack.MsgOptionText(action, false))
 		if err != nil {
 			log.Printf("送信エラー (%s): %v", user.Name, err)
-			store.Revert(userID)
+			store.Revert(id)
 			http.Error(w, "Slackへの送信に失敗しました", http.StatusInternalServerError)
 			return
 		}
@@ -378,7 +350,6 @@ func main() {
 
 	store = NewStore("users.json")
 
-	http.HandleFunc("/", handleTop)
 	http.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			handleRegisterPost(w, r)
@@ -386,6 +357,7 @@ func main() {
 			handleRegister(w, r)
 		}
 	})
+	http.HandleFunc("/t/", handleAttendance)
 
 	port := os.Getenv("PORT")
 	if port == "" {
