@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/joho/godotenv"
 	"github.com/slack-go/slack"
@@ -99,6 +100,12 @@ func (s *Store) Upsert(slackUID, name, token string) *User {
 	return u
 }
 
+func (s *Store) Get(id string) *User {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.users[id]
+}
+
 func (s *Store) Toggle(id string) (user *User, action string, ok bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -135,6 +142,8 @@ func generateID() string {
 // --------------- Config ---------------
 
 const hiByeBotOAuthURL = "https://slack.com/oauth/v2/authorize?client_id=2891184249.6899350542852&scope=&user_scope=chat:write"
+const cookieName = "nfc_uid"
+const cookieMaxAge = 365 * 24 * 60 * 60 // 1年
 
 var (
 	store     *Store
@@ -144,6 +153,24 @@ var (
 
 // --------------- Handlers ---------------
 
+// GET / — Cookieでユーザー判定。登録済みならhi/bye送信、未登録なら登録画面へ
+func handleTop(w http.ResponseWriter, r *http.Request) {
+	cookie, err := r.Cookie(cookieName)
+	if err != nil || cookie.Value == "" {
+		http.Redirect(w, r, "/register", http.StatusFound)
+		return
+	}
+
+	user := store.Get(cookie.Value)
+	if user == nil {
+		http.Redirect(w, r, "/register", http.StatusFound)
+		return
+	}
+
+	sendAttendance(w, cookie.Value)
+}
+
+// GET /register — 登録フォーム
 func handleRegister(w http.ResponseWriter, r *http.Request) {
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -173,7 +200,7 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 </head>
 <body>
 	<div class="container">
-		<h1>NFC 出退勤 - ユーザー登録</h1>
+		<h1>NFC 出退勤 - 初回登録</h1>
 		<div class="steps">
 			<b>Step 1:</b> 下のボタンからSlackでトークンを取得<br>
 			<b>Step 2:</b> 表示されたJSONの <code>access_token</code> をコピー<br>
@@ -183,7 +210,7 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 		<form method="POST" action="/register">
 			<label>アクセストークン（xoxp- から始まる文字列）</label>
 			<input type="text" name="token" placeholder="xoxp-..." required>
-			<button type="submit">登録してNFC URLを発行</button>
+			<button type="submit">登録する</button>
 		</form>
 	</div>
 </body>
@@ -193,6 +220,7 @@ func handleRegister(w http.ResponseWriter, r *http.Request) {
 	fmt.Fprint(w, html)
 }
 
+// POST /register — トークン検証・登録・Cookie発行
 func handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
 		http.Error(w, "フォームの解析に失敗しました", http.StatusBadRequest)
@@ -213,13 +241,18 @@ func handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	slackUID := authResp.UserID
-	name := authResp.User
+	user := store.Upsert(authResp.UserID, authResp.User, token)
 
-	user := store.Upsert(slackUID, name, token)
-	nfcURL := fmt.Sprintf("%s/t/%s", baseURL, user.ID)
+	http.SetCookie(w, &http.Cookie{
+		Name:     cookieName,
+		Value:    user.ID,
+		Path:     "/",
+		MaxAge:   cookieMaxAge,
+		HttpOnly: true,
+		SameSite: http.SameSiteLaxMode,
+	})
 
-	log.Printf("ユーザー登録: %s (%s) → %s", name, slackUID, user.ID)
+	log.Printf("ユーザー登録: %s (%s)", user.Name, user.SlackUID)
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -229,43 +262,35 @@ func handleRegisterPost(w http.ResponseWriter, r *http.Request) {
 	<title>登録完了</title>
 	<style>
 		*{margin:0;padding:0;box-sizing:border-box}
-		body{display:flex;justify-content:center;align-items:center;min-height:100vh;
-			font-family:-apple-system,sans-serif;background:#f5f5f5;padding:1rem}
-		.container{text-align:center;width:100%%;max-width:400px}
-		h2{font-size:1.3rem;color:#333;margin-bottom:1.5rem}
-		.url-box{background:#fff;border:2px solid #4CAF50;border-radius:8px;
-			padding:1rem;margin-bottom:1rem;word-break:break-all;
-			font-family:monospace;font-size:.85rem;user-select:all}
-		.note{color:#888;font-size:.8rem;line-height:1.6}
+		body{display:flex;justify-content:center;align-items:center;height:100vh;
+			font-family:-apple-system,sans-serif;background:#4CAF50;color:#fff}
+		.container{text-align:center;width:90%%;max-width:400px}
+		h2{font-size:1.4rem;margin-bottom:1rem}
+		p{opacity:.9;line-height:1.6}
 	</style>
 </head>
 <body>
 	<div class="container">
 		<h2>%s さんの登録が完了しました</h2>
-		<p style="margin-bottom:1rem;color:#666;">このURLをNFCタグに書き込んでください：</p>
-		<div class="url-box">%s</div>
-		<p class="note">
-			このURLにアクセスするたびに<br>
-			hi → bye → hi → ... と自動で切り替わります。
-		</p>
+		<p>次回からNFCタグをかざすだけで<br>自動的にhi/byeが送信されます。</p>
 	</div>
 </body>
-</html>`, name, nfcURL)
+</html>`, user.Name)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, html)
 }
 
-func handleAttendance(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/t/")
-	if id == "" {
-		http.Error(w, "ユーザーIDがありません", http.StatusBadRequest)
-		return
-	}
-
-	user, action, ok := store.Toggle(id)
+// hi/bye送信の共通処理
+func sendAttendance(w http.ResponseWriter, userID string) {
+	user, action, ok := store.Toggle(userID)
 	if !ok {
-		http.Error(w, "ユーザーが見つかりません。/register から登録してください。", http.StatusNotFound)
+		http.SetCookie(w, &http.Cookie{
+			Name:   cookieName,
+			Path:   "/",
+			MaxAge: -1,
+		})
+		http.Redirect(w, nil, "/register", http.StatusFound)
 		return
 	}
 
@@ -273,7 +298,7 @@ func handleAttendance(w http.ResponseWriter, r *http.Request) {
 	_, _, err := api.PostMessage(channelID, slack.MsgOptionText(action, false))
 	if err != nil {
 		log.Printf("送信エラー (%s): %v", user.Name, err)
-		store.Revert(id)
+		store.Revert(userID)
 		http.Error(w, "Slackへの送信に失敗しました", http.StatusInternalServerError)
 		return
 	}
@@ -284,6 +309,8 @@ func handleAttendance(w http.ResponseWriter, r *http.Request) {
 		label = "退勤 (bye)"
 		color = "#2196F3"
 	}
+
+	now := time.Now().In(time.FixedZone("JST", 9*60*60)).Format("15:04")
 
 	html := fmt.Sprintf(`<!DOCTYPE html>
 <html>
@@ -296,19 +323,21 @@ func handleAttendance(w http.ResponseWriter, r *http.Request) {
 		body{display:flex;justify-content:center;align-items:center;height:100vh;
 			font-family:-apple-system,sans-serif;background:%s;color:#fff}
 		.container{text-align:center}
-		h2{font-size:1.6rem;margin-bottom:.5rem}
-		p{opacity:.8}
+		h2{font-size:1.8rem;margin-bottom:.3rem}
+		.time{font-size:3rem;font-weight:bold;margin:.5rem 0}
+		p{opacity:.8;font-size:.9rem}
 	</style>
 </head>
 <body>
 	<div class="container">
 		<h2>%s</h2>
+		<div class="time">%s</div>
 		<p>%s さん</p>
 		<p style="margin-top:1rem">この画面は自動的に閉じます。</p>
 	</div>
 	<script>setTimeout(function(){ window.close(); }, 2000);</script>
 </body>
-</html>`, color, label, user.Name)
+</html>`, color, label, now, user.Name)
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	fmt.Fprint(w, html)
@@ -328,6 +357,7 @@ func main() {
 
 	store = NewStore("users.json")
 
+	http.HandleFunc("/", handleTop)
 	http.HandleFunc("/register", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
 			handleRegisterPost(w, r)
@@ -335,8 +365,6 @@ func main() {
 			handleRegister(w, r)
 		}
 	})
-	http.HandleFunc("/", handleRegister)
-	http.HandleFunc("/t/", handleAttendance)
 
 	port := os.Getenv("PORT")
 	if port == "" {
